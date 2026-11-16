@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>BTC 數據快照</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#141413">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="BTC快照">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+:root{--bg:#f6f6f4;--card:#fff;--fg:#1d1d1b;--mut:#6b6a66;--line:#e2e0da;--up:#1a7f4b;--dn:#c0392b;--acc:#2f6fd6}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--card:#1f1f1d;--fg:#ecebe6;--mut:#a3a199;--line:#33322f;--up:#4cc38a;--dn:#ef6b5e;--acc:#6ea2ff}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Noto Sans TC",sans-serif;padding:calc(12px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) calc(40px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left))}
+h1{font-size:18px;margin:4px 0 2px;font-weight:600}
+.sub{color:var(--mut);font-size:12px}
+.bar{display:flex;gap:8px;margin:10px 0;flex-wrap:wrap}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:10px;padding:10px 14px;flex:1;min-width:120px}
+button.pri{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:10px 0}
+.card h2{font-size:14px;margin:0 0 8px;color:var(--mut);font-weight:600}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px}
+.k{color:var(--mut);font-size:12px}.v{font-variant-numeric:tabular-nums;font-weight:600}
+.big{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums}
+.up{color:var(--up)}.dn{color:var(--dn)}
+table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+th,td{padding:4px 3px;text-align:right;border-bottom:1px solid var(--line)}th:first-child,td:first-child{text-align:left}
+th{color:var(--mut);font-weight:500}
+.err{color:var(--dn);font-size:12px;white-space:pre-wrap}
+.pos{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}
+input,select{font:inherit;width:100%;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
+textarea{width:100%;height:220px;font:12px/1.4 ui-monospace,Menlo,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px}
+#toast{position:sticky;bottom:10px;text-align:center;opacity:0;transition:opacity .3s;pointer-events:none}
+#toast span{background:var(--fg);color:var(--bg);padding:8px 14px;border-radius:20px;font-size:13px}
+</style>
+</head>
+<body>
+<h1>BTC 數據快照</h1>
+<div class="sub">Binance 公開 API，直接由你的瀏覽器抓取 · <span id="ts">尚未更新</span></div>
+<div class="bar">
+  <button id="btnRefresh">重新整理</button>
+  <button id="btnCopy" class="pri">複製摘要給 Claude</button>
+</div>
+<div id="status" class="err"></div>
+
+<div class="card"><h2>價格</h2><div id="price"></div></div>
+<div class="card"><h2>日線</h2><div id="daily"></div></div>
+<div class="card"><h2>週線</h2><div id="weekly"></div></div>
+<div class="card"><h2>4 小時</h2><div id="h4"></div></div>
+<div class="card"><h2>最近 12 根 4H（台灣時間）</h2><div id="flow"></div></div>
+<div class="card"><h2>合約</h2><div id="fut"></div></div>
+<div class="card"><h2>我的部位（選填，只存在這支手機）</h2>
+  <div class="pos">
+    <select id="pSide"><option value="">無部位</option><option value="short">空</option><option value="long">多</option></select>
+    <input id="pEntry" type="number" inputmode="decimal" placeholder="開倉價">
+    <input id="pLev" type="number" inputmode="decimal" placeholder="槓桿" value="10">
+  </div>
+  <div id="posOut" style="margin-top:8px"></div>
+</div>
+<details class="card"><summary>摘要文字（複製失敗時長按全選）</summary><textarea id="sum" readonly></textarea></details>
+<div id="toast"><span>已複製，貼到 Claude 對話即可</span></div>
+
+<script>
+const SPOT_HOSTS=['https://api.binance.com','https://data-api.binance.vision'];
+const FUT='https://fapi.binance.com';
+const MMR=0.004;
+const $=id=>document.getElementById(id);
+let SNAP=null;
+
+async function getJSON(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(r.status+' '+(await r.text()).slice(0,100));return r.json();}
+async function spot(path){let last;for(const h of SPOT_HOSTS){try{return await getJSON(h+path);}catch(e){last=e;}}throw last;}
+const fut=path=>getJSON(FUT+path);
+
+const sma=(a,n,i)=>{if(i==null)i=a.length-1;if(i-n+1<0)return null;let s=0;for(let k=i-n+1;k<=i;k++)s+=a[k];return s/n;};
+function emaS(a,n){const k=2/(n+1),e=new Array(a.length).fill(null);if(a.length<n)return e;let p=0;for(let i=0;i<n;i++)p+=a[i];p/=n;e[n-1]=p;for(let i=n;i<a.length;i++){p=a[i]*k+p*(1-k);e[i]=p;}return e;}
+function rsiS(a,n=14){const r=new Array(a.length).fill(null);if(a.length<=n)return r;let g=0,l=0;for(let i=1;i<=n;i++){const c=a[i]-a[i-1];if(c>0)g+=c;else l-=c;}g/=n;l/=n;r[n]=l===0?100:100-100/(1+g/l);for(let i=n+1;i<a.length;i++){const c=a[i]-a[i-1];g=(g*(n-1)+Math.max(c,0))/n;l=(l*(n-1)+Math.max(-c,0))/n;r[i]=l===0?100:100-100/(1+g/l);}return r;}
+const pk=k=>({t:k.map(x=>+x[0]),o:k.map(x=>+x[1]),h:k.map(x=>+x[2]),l:k.map(x=>+x[3]),c:k.map(x=>+x[4]),v:k.map(x=>+x[5]),tb:k.map(x=>+x[9])});
+const tw=(t,len=16)=>new Date(+t+8*3600e3).toISOString().slice(0,len).replace('T',' ');
+const n0=x=>x==null||isNaN(x)?'—':Math.round(x).toLocaleString('en-US');
+const n2=x=>x==null||isNaN(x)?'—':(+x).toFixed(2);
+const pc=(x,d=2)=>x==null||isNaN(x)?'—':(x>=0?'+':'')+(x*100).toFixed(d)+'%';
+const cls=x=>x==null?'':(x>=0?'up':'dn');
+const kv=(k,v,c='')=>`<div><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`;
+
+async function load(){
+  $('status').textContent='讀取中…';
+  const req={
+    d:spot('/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=600'),
+    w:spot('/api/v3/klines?symbol=BTCUSDT&interval=1w&limit=260'),
+    h:spot('/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=300'),
+    pi:fut('/fapi/v1/premiumIndex?symbol=BTCUSDT'),
+    fr:fut('/fapi/v1/fundingRate?symbol=BTCUSDT&limit=30'),
+    oid:fut('/futures/data/openInterestHist?symbol=BTCUSDT&period=1d&limit=30'),
+    oi4:fut('/futures/data/openInterestHist?symbol=BTCUSDT&period=4h&limit=30'),
+    tk:fut('/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=4h&limit=12'),
+    ls:fut('/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=4h&limit=12'),
+    top:fut('/futures/data/topLongShortPositionRatio?symbol=BTCUSDT&period=4h&limit=12'),
+    pk4:fut('/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=30')
+  };
+  const keys=Object.keys(req),res=await Promise.allSettled(Object.values(req)),R={},E=[];
+  keys.forEach((k,i)=>{if(res[i].status==='fulfilled')R[k]=res[i].value;else E.push(k+': '+res[i].reason.message);});
+  $('status').textContent=E.length?('部分資料讀取失敗：\n'+E.join('\n')):'';
+  SNAP=compute(R);SNAP.errors=E;render(SNAP);
+}
+
+function compute(R){
+  const S={now:Date.now()};
+  if(R.d){const D=pk(R.d),n=D.c.length-1,r=rsiS(D.c),e21=emaS(D.c,21);
+    const bias=[];for(let i=19;i<=n;i++)bias.push(D.c[i]/sma(D.c,20,i)-1);
+    const cb=bias[bias.length-1];
+    const lows={},highs={};for(let i=Math.max(0,n-200);i<=n;i++){const m=tw(D.t[i],7);if(!lows[m]||D.l[i]<lows[m][1])lows[m]=[tw(D.t[i],10),D.l[i]];if(!highs[m]||D.h[i]>highs[m][1])highs[m]=[tw(D.t[i],10),D.h[i]];}
+    let mn=1/0,mnI=0,mx=-1/0,mxI=0;for(let i=n-29;i<=n;i++){if(D.l[i]<mn){mn=D.l[i];mnI=i;}if(D.h[i]>mx){mx=D.h[i];mxI=i;}}
+    const rows=[];for(let i=n-6;i<=n;i++)rows.push({d:tw(D.t[i],10).slice(5),o:D.o[i],h:D.h[i],l:D.l[i],c:D.c[i],v:D.v[i],dl:2*D.tb[i]-D.v[i],rsi:r[i]});
+    S.d={price:D.c[n],today:{o:D.o[n],h:D.h[n],l:D.l[n],c:D.c[n]},prev:{o:D.o[n-1],h:D.h[n-1],l:D.l[n-1],c:D.c[n-1]},
+      ma20:sma(D.c,20),ma20_5:sma(D.c,20,n-5),ma50:sma(D.c,50),ma50_5:sma(D.c,50,n-5),ma200:sma(D.c,200),ma200_10:sma(D.c,200,n-10),ema21:e21[n],
+      rsi:r[n],rsiPrev:r[n-1],bias:cb,biasPct:bias.filter(x=>x<=cb).length/bias.length,biasDays:bias.length,
+      lo30:[tw(D.t[mnI],10),mn],hi30:[tw(D.t[mxI],10),mx],lows,highs,rows};}
+  if(R.w){const W=pk(R.w),m=W.c.length-1,r=rsiS(W.c),e21=emaS(W.c,21);
+    S.w={cur:{d:tw(W.t[m],10),o:W.o[m],h:W.h[m],l:W.l[m],c:W.c[m]},prev:{d:tw(W.t[m-1],10),o:W.o[m-1],h:W.h[m-1],l:W.l[m-1],c:W.c[m-1]},
+      wma200:sma(W.c,200),wma200_prevClose:sma(W.c,200,m-1),wma200_4:sma(W.c,200,m-4),sma20:sma(W.c,20),ema21:e21[m],sma50:sma(W.c,50),rsi:r[m],rsiPrev:r[m-1]};}
+  if(R.h){const H=pk(R.h),q=H.c.length-1,r=rsiS(H.c);
+    S.h={ma20:sma(H.c,20),ma50:sma(H.c,50),ma200:sma(H.c,200),rsi:r[q]};
+    const perp={};if(R.pk4)R.pk4.forEach(x=>perp[+x[0]]=2*(+x[9])-(+x[5]));
+    const oi={};if(R.oi4)R.oi4.forEach(x=>oi[+x.timestamp]=+x.sumOpenInterest);
+    const rows=[];for(let i=q-11;i<=q;i++){const t=H.t[i];rows.push({t:tw(t).slice(5),c:H.c[i],h:H.h[i],l:H.l[i],sd:2*H.tb[i]-H.v[i],pd:perp[t],oi:oi[t+4*3600e3],rsi:r[i]});}
+    S.flow=rows;}
+  if(R.pi)S.f={mark:+R.pi.markPrice,index:+R.pi.indexPrice,predFunding:+R.pi.lastFundingRate};
+  if(R.fr&&R.fr.length){const f=R.fr.map(x=>+x.fundingRate);S.f=Object.assign(S.f||{},{lastSettled:f[f.length-1],minF:Math.min(...f),maxF:Math.max(...f),negCount:f.filter(x=>x<0).length,frN:f.length});}
+  if(R.oid&&R.oid.length){const a=R.oid.map(x=>+x.sumOpenInterest),L=a.length-1;S.f=Object.assign(S.f||{},{oiBTC:a[L],oi1d:a[L]/a[L-1]-1,oi7d:L>=7?a[L]/a[L-7]-1:null,oiUSD:+R.oid[L].sumOpenInterestValue});}
+  if(R.oi4&&R.oi4.length){const a=R.oi4.map(x=>+x.sumOpenInterest),L=a.length-1;S.f=Object.assign(S.f||{},{oi4hNow:a[L],oi24h:L>=6?a[L]/a[L-6]-1:null});}
+  const last=(arr,key)=>arr&&arr.length?+arr[arr.length-1][key]:null, ago=(arr,key,k)=>arr&&arr.length>k?+arr[arr.length-1-k][key]:null;
+  S.f=Object.assign(S.f||{},{ls:last(R.ls,'longShortRatio'),ls24:ago(R.ls,'longShortRatio',6),top:last(R.top,'longShortRatio'),top24:ago(R.top,'longShortRatio',6),
+    tk:R.tk?R.tk.slice(-6).map(x=>+x.buySellRatio):null});
+  return S;
+}
+
+function posCalc(price){
+  const side=$('pSide').value,e=parseFloat($('pEntry').value),lev=parseFloat($('pLev').value)||10;
+  try{localStorage.setItem('btcpos',JSON.stringify({side,e:$('pEntry').value,lev:$('pLev').value}));}catch(_){}
+  if(!side||!e||!price)return null;
+  const pnl=side==='short'?(e-price)/e:(price-e)/e;
+  const liq=side==='short'?e*(1+1/lev-MMR):e*(1-1/lev+MMR);
+  return {side,e,lev,pnl,roe:pnl*lev,liq,dist:side==='short'?liq/price-1:1-liq/price};
+}
+
+function render(S){
+  $('ts').textContent='更新於 '+tw(S.now,19)+'（台灣時間）';
+  const d=S.d,w=S.w,h=S.h,f=S.f||{};
+  if(d){const chg=d.today.c/d.prev.c-1;
+    $('price').innerHTML=`<div class="big">${n0(d.price)}</div><div class="${cls(chg)}">${pc(chg)} 相對昨收 ${n0(d.prev.c)}</div>`+
+      `<div class="grid" style="margin-top:6px">${kv('今日 高/低',n0(d.today.h)+' / '+n0(d.today.l))}${kv('近 30 日 高/低',n0(d.hi30[1])+' / '+n0(d.lo30[1]))}</div>`;
+    $('daily').innerHTML=`<div class="grid">
+      ${kv('MA20（5 日前）',n0(d.ma20)+'（'+n0(d.ma20_5)+'）')}${kv('MA50（5 日前）',n0(d.ma50)+'（'+n0(d.ma50_5)+'）')}
+      ${kv('MA200（10 日前）',n0(d.ma200)+'（'+n0(d.ma200_10)+'）')}${kv('EMA21',n0(d.ema21))}
+      ${kv('RSI14（昨）',n2(d.rsi)+'（'+n2(d.rsiPrev)+'）')}${kv('乖離 MA20',pc(d.bias),cls(d.bias))}
+      ${kv('乖離歷史分位',(d.biasPct*100).toFixed(1)+'%（'+d.biasDays+' 天）')}${kv('距 MA200',pc(d.price/d.ma200-1),cls(d.price/d.ma200-1))}
+    </div>`;}
+  if(w){$('weekly').innerHTML=`<div class="grid">
+      ${kv('上週收（'+w.prev.d.slice(5)+' 起）',n0(w.prev.c))}${kv('本週 開/高/低',n0(w.cur.o)+' / '+n0(w.cur.h)+' / '+n0(w.cur.l))}
+      ${kv('200W MA（4 週前）',n0(w.wma200)+'（'+n0(w.wma200_4)+'）')}${kv('20W SMA / 21W EMA',n0(w.sma20)+' / '+n0(w.ema21))}
+      ${kv('50W SMA',n0(w.sma50))}${kv('週 RSI（上週）',n2(w.rsi)+'（'+n2(w.rsiPrev)+'）')}
+    </div>`;}
+  if(h){$('h4').innerHTML=`<div class="grid">${kv('MA20',n0(h.ma20))}${kv('MA50',n0(h.ma50))}${kv('MA200',n0(h.ma200))}${kv('RSI14',n2(h.rsi))}</div>`;}
+  if(S.flow){$('flow').innerHTML=`<table><tr><th>時間</th><th>收</th><th>現貨Δ</th><th>合約Δ</th><th>OI(BTC)</th><th>RSI</th></tr>`+
+    S.flow.map(r=>`<tr><td>${r.t}</td><td>${n0(r.c)}</td><td class="${cls(r.sd)}">${n0(r.sd)}</td><td class="${cls(r.pd)}">${n0(r.pd)}</td><td>${n0(r.oi)}</td><td>${n2(r.rsi)}</td></tr>`).join('')+
+    `</table><div class="sub" style="margin-top:6px">Δ = 主動買 − 主動賣（BTC）。OI 為該根收盤時的未平倉量。</div>`;}
+  $('fut').innerHTML=`<div class="grid">
+    ${kv('標記價',n0(f.mark))}${kv('預估資金費率',f.predFunding==null?'—':(f.predFunding*100).toFixed(4)+'%',cls(f.predFunding))}
+    ${kv('近 '+(f.frN||'—')+' 期 最低/最高',f.minF==null?'—':(f.minF*100).toFixed(4)+'% / '+(f.maxF*100).toFixed(4)+'%')}${kv('負費率期數',f.negCount==null?'—':f.negCount)}
+    ${kv('OI（BTC）',n0(f.oiBTC))}${kv('OI 24h / 7d',pc(f.oi24h)+' / '+pc(f.oi7d))}
+    ${kv('散戶多空帳戶比（24h 前）',n2(f.ls)+'（'+n2(f.ls24)+'）')}${kv('大戶持倉比（24h 前）',n2(f.top)+'（'+n2(f.top24)+'）')}
+    ${kv('主動買賣比 近 6 根 4H',f.tk?f.tk.map(n2).join(' '):'—')}
+  </div>`;
+  const p=posCalc(d&&d.price);
+  $('posOut').innerHTML=p?`<div class="grid">${kv('浮動損益',pc(p.pnl)+'（保證金 '+pc(p.roe,1)+'）',cls(p.pnl))}${kv('估計強平價',n0(p.liq)+'（距 '+pc(p.dist,1)+'）')}</div><div class="sub">逐倉估算，維持保證金率以 0.4% 計，未含手續費與資金費。</div>`:'<div class="sub">填入方向、開倉價、槓桿後，會一起放進摘要。</div>';
+  $('sum').value=summary(S,p);
+}
+
+function summary(S,p){
+  const d=S.d,w=S.w,h=S.h,f=S.f||{},L=[];
+  L.push('BTC 數據快照 '+tw(S.now,16)+'（UTC+8）');
+  if(d){L.push(`價格 ${n0(d.price)}｜今日 O${n0(d.today.o)} H${n0(d.today.h)} L${n0(d.today.l)}｜昨日 O${n0(d.prev.o)} H${n0(d.prev.h)} L${n0(d.prev.l)} C${n0(d.prev.c)}`);
+    L.push(`[日線] MA20 ${n0(d.ma20)}(5d前${n0(d.ma20_5)}) MA50 ${n0(d.ma50)}(5d前${n0(d.ma50_5)}) MA200 ${n0(d.ma200)}(10d前${n0(d.ma200_10)}) EMA21 ${n0(d.ema21)}｜RSI ${n2(d.rsi)}(昨${n2(d.rsiPrev)})｜乖離MA20 ${pc(d.bias)} 分位${(d.biasPct*100).toFixed(1)}%`);
+    L.push(`近30日 高${n0(d.hi30[1])}(${d.hi30[0].slice(5)}) 低${n0(d.lo30[1])}(${d.lo30[0].slice(5)})`);
+    L.push('月低 '+Object.entries(d.lows).map(([m,v])=>m.slice(2)+':'+n0(v[1])+'@'+v[0].slice(8)).join(' '));
+    L.push('月高 '+Object.entries(d.highs).map(([m,v])=>m.slice(2)+':'+n0(v[1])+'@'+v[0].slice(8)).join(' '));
+    L.push('近7日 日期 O/H/L/C 量 現貨Δ RSI');d.rows.forEach(r=>L.push(`${r.d} ${n0(r.o)}/${n0(r.h)}/${n0(r.l)}/${n0(r.c)} ${n0(r.v)} ${n0(r.dl)} ${n2(r.rsi)}`));}
+  if(w)L.push(`[週線] 上週(${w.prev.d.slice(5)}) O${n0(w.prev.o)} H${n0(w.prev.h)} L${n0(w.prev.l)} C${n0(w.prev.c)}｜本週 O${n0(w.cur.o)} H${n0(w.cur.h)} L${n0(w.cur.l)} C${n0(w.cur.c)}｜200W ${n0(w.wma200)}(4週前${n0(w.wma200_4)}) 20W ${n0(w.sma20)} 21WEMA ${n0(w.ema21)} 50W ${n0(w.sma50)}｜週RSI ${n2(w.rsi)}(上週${n2(w.rsiPrev)})`);
+  if(h)L.push(`[4H] MA20 ${n0(h.ma20)} MA50 ${n0(h.ma50)} MA200 ${n0(h.ma200)} RSI ${n2(h.rsi)}`);
+  if(S.flow){L.push('4H 時間 收 現貨Δ 合約Δ OI RSI');S.flow.forEach(r=>L.push(`${r.t} ${n0(r.c)} ${n0(r.sd)} ${n0(r.pd)} ${n0(r.oi)} ${n2(r.rsi)}`));}
+  L.push(`[合約] 標記${n0(f.mark)} 預估費率${f.predFunding==null?'—':(f.predFunding*100).toFixed(4)+'%'} 近${f.frN||'—'}期 最低${f.minF==null?'—':(f.minF*100).toFixed(4)+'%'} 最高${f.maxF==null?'—':(f.maxF*100).toFixed(4)+'%'} 負費率${f.negCount??'—'}期｜OI ${n0(f.oiBTC)}BTC 24h${pc(f.oi24h)} 7d${pc(f.oi7d)}｜帳戶多空比${n2(f.ls)}(24h前${n2(f.ls24)}) 大戶持倉比${n2(f.top)}(24h前${n2(f.top24)})｜主動買賣比 ${f.tk?f.tk.map(n2).join(' '):'—'}`);
+  if(p)L.push(`[部位] ${p.side==='short'?'空':'多'} ${n0(p.e)} x${p.lev}｜損益 ${pc(p.pnl)}(保證金${pc(p.roe,1)})｜估強平 ${n0(p.liq)}`);
+  if(S.errors&&S.errors.length)L.push('讀取失敗：'+S.errors.join('；'));
+  return L.join('\n');
+}
+
+function toast(){const t=$('toast');t.style.opacity=1;setTimeout(()=>t.style.opacity=0,1800);}
+$('btnRefresh').onclick=load;
+$('btnCopy').onclick=async()=>{const txt=$('sum').value;if(!txt)return;
+  try{await navigator.clipboard.writeText(txt);toast();}
+  catch(_){const ta=$('sum');ta.closest('details').open=true;ta.focus();ta.select();try{document.execCommand('copy');toast();}catch(__){}}};
+['pSide','pEntry','pLev'].forEach(id=>$(id).addEventListener('input',()=>SNAP&&render(SNAP)));
+try{const s=JSON.parse(localStorage.getItem('btcpos')||'{}');if(s.side)$('pSide').value=s.side;if(s.e)$('pEntry').value=s.e;if(s.lev)$('pLev').value=s.lev;}catch(_){}
+load();
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&SNAP&&Date.now()-SNAP.now>60e3)load();});
+if('serviceWorker' in navigator&&location.protocol==='https:')navigator.serviceWorker.register('sw.js').catch(()=>{});
+</script>
+</body>
+</html>
