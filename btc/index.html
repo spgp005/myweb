@@ -53,6 +53,8 @@ textarea{width:100%;height:220px;font:12px/1.4 ui-monospace,Menlo,monospace;back
 <div class="card"><h2>週線</h2><div id="weekly"></div></div>
 <div class="card"><h2>4 小時</h2><div id="h4"></div></div>
 <div class="card"><h2>最近 12 根 4H（台灣時間）</h2><div id="flow"></div></div>
+<div class="card"><h2>自 30 日低點累計（錨定 CVD）</h2><div id="anch"></div></div>
+<div class="card"><h2>最近 12 根 1H（台灣時間）</h2><div id="h1"></div></div>
 <div class="card"><h2>合約</h2><div id="fut"></div></div>
 <div class="card"><h2>我的部位（選填，只存在這支手機）</h2>
   <div class="pos">
@@ -96,11 +98,14 @@ async function load(){
     pi:fut('/fapi/v1/premiumIndex?symbol=BTCUSDT'),
     fr:fut('/fapi/v1/fundingRate?symbol=BTCUSDT&limit=30'),
     oid:fut('/futures/data/openInterestHist?symbol=BTCUSDT&period=1d&limit=30'),
-    oi4:fut('/futures/data/openInterestHist?symbol=BTCUSDT&period=4h&limit=30'),
+    oi4:fut('/futures/data/openInterestHist?symbol=BTCUSDT&period=4h&limit=180'),
+    h1:spot('/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=48'),
+    pk1:fut('/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=14'),
+    oi1:fut('/futures/data/openInterestHist?symbol=BTCUSDT&period=1h&limit=16'),
     tk:fut('/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=4h&limit=12'),
     ls:fut('/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=4h&limit=12'),
     top:fut('/futures/data/topLongShortPositionRatio?symbol=BTCUSDT&period=4h&limit=12'),
-    pk4:fut('/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=30')
+    pk4:fut('/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=200')
   };
   const keys=Object.keys(req),res=await Promise.allSettled(Object.values(req)),R={},E=[];
   keys.forEach((k,i)=>{if(res[i].status==='fulfilled')R[k]=res[i].value;else E.push(k+': '+res[i].reason.message);});
@@ -128,7 +133,18 @@ function compute(R){
     const perp={};if(R.pk4)R.pk4.forEach(x=>perp[+x[0]]=2*(+x[9])-(+x[5]));
     const oi={};if(R.oi4)R.oi4.forEach(x=>oi[+x.timestamp]=+x.sumOpenInterest);
     const rows=[];for(let i=q-11;i<=q;i++){const t=H.t[i];rows.push({t:tw(t).slice(5),c:H.c[i],h:H.h[i],l:H.l[i],sd:2*H.tb[i]-H.v[i],pd:perp[t],oi:oi[t+4*3600e3],rsi:r[i]});}
-    S.flow=rows;}
+    S.flow=rows;
+    let li=Math.max(0,q-179);for(let i=li;i<=q;i++)if(H.l[i]<H.l[li])li=i;
+    let sc=0,pcv=0,pn=0;for(let i=li;i<=q;i++){sc+=2*H.tb[i]-H.v[i];const v=perp[H.t[i]];if(v!=null){pcv+=v;pn++;}}
+    const oiK=Object.keys(oi).map(Number).sort((a,b)=>a-b),oiNow=oiK.length?oi[oiK[oiK.length-1]]:null,oiLow=oi[H.t[li]];
+    S.anch={t:tw(H.t[li]),low:H.l[li],bars:q-li+1,spot:sc,perp:pn===q-li+1?pcv:null,oiLow,oiNow,oiChg:(oiLow&&oiNow)?oiNow/oiLow-1:null};}
+  if(R.h1){const H=pk(R.h1),q=H.c.length-1;
+    const perp={};if(R.pk1)R.pk1.forEach(x=>perp[+x[0]]=2*(+x[9])-(+x[5]));
+    const oi={};if(R.oi1)R.oi1.forEach(x=>oi[+x.timestamp]=+x.sumOpenInterest);
+    const rows=[];for(let i=q-11;i<=q;i++){const t=H.t[i],o=oi[t+3600e3],o0=oi[t];rows.push({t:tw(t).slice(5),c:H.c[i],sd:2*H.tb[i]-H.v[i],pd:perp[t],oi:o,doi:(o!=null&&o0!=null)?o-o0:null});}
+    let streak=0;for(let i=rows.length-2;i>=0;i--){if(rows[i].sd>0)streak++;else break;}
+    let hi=-1/0,lo=1/0,hiT=0,loT=0;for(let i=Math.max(0,q-23);i<=q;i++){if(H.h[i]>hi){hi=H.h[i];hiT=H.t[i];}if(H.l[i]<lo){lo=H.l[i];loT=H.t[i];}}
+    S.h1={rows,streak,curPos:rows[rows.length-1].sd>0,hi,lo,hiT:tw(hiT).slice(5),loT:tw(loT).slice(5)};}
   if(R.pi)S.f={mark:+R.pi.markPrice,index:+R.pi.indexPrice,predFunding:+R.pi.lastFundingRate};
   if(R.fr&&R.fr.length){const f=R.fr.map(x=>+x.fundingRate);S.f=Object.assign(S.f||{},{lastSettled:f[f.length-1],minF:Math.min(...f),maxF:Math.max(...f),negCount:f.filter(x=>x<0).length,frN:f.length});}
   if(R.oid&&R.oid.length){const a=R.oid.map(x=>+x.sumOpenInterest),L=a.length-1;S.f=Object.assign(S.f||{},{oiBTC:a[L],oi1d:a[L]/a[L-1]-1,oi7d:L>=7?a[L]/a[L-7]-1:null,oiUSD:+R.oid[L].sumOpenInterestValue});}
@@ -169,6 +185,17 @@ function render(S){
   if(S.flow){$('flow').innerHTML=`<table><tr><th>時間</th><th>收</th><th>現貨Δ</th><th>合約Δ</th><th>OI(BTC)</th><th>RSI</th></tr>`+
     S.flow.map(r=>`<tr><td>${r.t}</td><td>${n0(r.c)}</td><td class="${cls(r.sd)}">${n0(r.sd)}</td><td class="${cls(r.pd)}">${n0(r.pd)}</td><td>${n0(r.oi)}</td><td>${n2(r.rsi)}</td></tr>`).join('')+
     `</table><div class="sub" style="margin-top:6px">Δ = 主動買 − 主動賣（BTC）。OI 為該根收盤時的未平倉量。</div>`;}
+  if(S.anch){const a=S.anch;$('anch').innerHTML=`<div class="grid">
+    ${kv('起點（4H，含低點那根）',a.t.slice(5)+' · 低 '+n0(a.low))}${kv('經過',a.bars+' 根 4H')}
+    ${kv('現貨累計淨量',n0(a.spot)+' BTC',cls(a.spot))}${kv('合約累計淨量',a.perp==null?'—':n0(a.perp)+' BTC',cls(a.perp))}
+    ${kv('OI 變化（BTC）',a.oiLow?n0(a.oiLow)+' → '+n0(a.oiNow):'—')}${kv('OI 變化 %',pc(a.oiChg),cls(a.oiChg))}
+  </div>`;}
+  if(S.h1){const x=S.h1;$('h1').innerHTML=`<div class="grid" style="margin-bottom:8px">
+    ${kv('24h 高',n0(x.hi)+'（'+x.hiT+'）')}${kv('24h 低',n0(x.lo)+'（'+x.loT+'）')}
+    ${kv('現貨淨量連續為正（已收盤）',x.streak+' 根',x.streak>0?'up':'')}${kv('目前這根',x.curPos?'正':'負',x.curPos?'up':'dn')}
+  </div><table><tr><th>時間</th><th>收</th><th>現貨Δ</th><th>合約Δ</th><th>OI</th><th>ΔOI</th></tr>`+
+    x.rows.map(r=>`<tr><td>${r.t}</td><td>${n0(r.c)}</td><td class="${cls(r.sd)}">${n0(r.sd)}</td><td class="${cls(r.pd)}">${n0(r.pd)}</td><td>${n0(r.oi)}</td><td class="${cls(r.doi)}">${n0(r.doi)}</td></tr>`).join('')+
+    `</table><div class="sub" style="margin-top:6px">最後一列是尚未收盤的那根。ΔOI 為該根內 OI 增減（BTC）。</div>`;}
   $('fut').innerHTML=`<div class="grid">
     ${kv('標記價',n0(f.mark))}${kv('預估資金費率',f.predFunding==null?'—':(f.predFunding*100).toFixed(4)+'%',cls(f.predFunding))}
     ${kv('近 '+(f.frN||'—')+' 期 最低/最高',f.minF==null?'—':(f.minF*100).toFixed(4)+'% / '+(f.maxF*100).toFixed(4)+'%')}${kv('負費率期數',f.negCount==null?'—':f.negCount)}
@@ -193,6 +220,9 @@ function summary(S,p){
   if(w)L.push(`[週線] 上週(${w.prev.d.slice(5)}) O${n0(w.prev.o)} H${n0(w.prev.h)} L${n0(w.prev.l)} C${n0(w.prev.c)}｜本週 O${n0(w.cur.o)} H${n0(w.cur.h)} L${n0(w.cur.l)} C${n0(w.cur.c)}｜200W ${n0(w.wma200)}(4週前${n0(w.wma200_4)}) 20W ${n0(w.sma20)} 21WEMA ${n0(w.ema21)} 50W ${n0(w.sma50)}｜週RSI ${n2(w.rsi)}(上週${n2(w.rsiPrev)})`);
   if(h)L.push(`[4H] MA20 ${n0(h.ma20)} MA50 ${n0(h.ma50)} MA200 ${n0(h.ma200)} RSI ${n2(h.rsi)}`);
   if(S.flow){L.push('4H 時間 收 現貨Δ 合約Δ OI RSI');S.flow.forEach(r=>L.push(`${r.t} ${n0(r.c)} ${n0(r.sd)} ${n0(r.pd)} ${n0(r.oi)} ${n2(r.rsi)}`));}
+  if(S.anch){const a=S.anch;L.push(`[錨定] 自30日低點 ${a.t.slice(5)}(低${n0(a.low)}) ${a.bars}根4H｜現貨累計Δ ${n0(a.spot)}｜合約累計Δ ${a.perp==null?'—':n0(a.perp)}｜OI ${a.oiLow?n0(a.oiLow)+'→'+n0(a.oiNow)+' '+pc(a.oiChg):'—'}`);}
+  if(S.h1){const x=S.h1;L.push(`[1H] 24h高${n0(x.hi)}(${x.hiT}) 低${n0(x.lo)}(${x.loT})｜現貨Δ連續為正 ${x.streak} 根(已收)｜當根${x.curPos?'正':'負'}`);
+    L.push('1H 時間 收 現貨Δ 合約Δ OI ΔOI（最後一列未收）');x.rows.forEach(r=>L.push(`${r.t} ${n0(r.c)} ${n0(r.sd)} ${n0(r.pd)} ${n0(r.oi)} ${n0(r.doi)}`));}
   L.push(`[合約] 標記${n0(f.mark)} 預估費率${f.predFunding==null?'—':(f.predFunding*100).toFixed(4)+'%'} 近${f.frN||'—'}期 最低${f.minF==null?'—':(f.minF*100).toFixed(4)+'%'} 最高${f.maxF==null?'—':(f.maxF*100).toFixed(4)+'%'} 負費率${f.negCount??'—'}期｜OI ${n0(f.oiBTC)}BTC 24h${pc(f.oi24h)} 7d${pc(f.oi7d)}｜帳戶多空比${n2(f.ls)}(24h前${n2(f.ls24)}) 大戶持倉比${n2(f.top)}(24h前${n2(f.top24)})｜主動買賣比 ${f.tk?f.tk.map(n2).join(' '):'—'}`);
   if(p)L.push(`[部位] ${p.side==='short'?'空':'多'} ${n0(p.e)} x${p.lev}｜損益 ${pc(p.pnl)}(保證金${pc(p.roe,1)})｜估強平 ${n0(p.liq)}`);
   if(S.errors&&S.errors.length)L.push('讀取失敗：'+S.errors.join('；'));
