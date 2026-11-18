@@ -129,11 +129,14 @@ function classify(rows,oiRef,thF,absMin){const th=oiRef?oiRef*thF:80;
 // 燃料分數：每項換成 0~1，多方＝推升/軋空的燃料，空方＝下殺/殺多的燃料，再依權重加總成 0~100
 function quant(S){
   const f=S.f||{},x=S.h1;if(!x)return null;
-  let ns=0,sc=0,nl=0,lc=0,sd=0,vol=0,nS=0,nB=0;
+  // 庫存照時間順序一根一根累計、不低於 0：回補／平倉只能扣掉視窗內「更早」建立的倉位，
+  // 不會把之後才進場的新倉抵銷掉（例：早上回補的是舊空單，不該抵掉 09:00 才進場的新空）
+  let ns=0,sc=0,nl=0,lc=0,sInv=0,lInv=0,sd=0,vol=0,nS=0,nB=0;
   x.rows.forEach(r=>{const a=r.doi?Math.abs(r.doi.v):0;
-    if(r.kind==='ns')ns+=a;else if(r.kind==='sc')sc+=a;else if(r.kind==='nl')nl+=a;else if(r.kind==='lc')lc+=a;
+    if(r.kind==='ns'){ns+=a;sInv+=a;}else if(r.kind==='sc'){sc+=a;sInv=Math.max(0,sInv-a);}
+    else if(r.kind==='nl'){nl+=a;lInv+=a;}else if(r.kind==='lc'){lc+=a;lInv=Math.max(0,lInv-a);}
     sd+=r.sd||0;vol+=r.v||0;if(r.ab==='S')nS++;if(r.ab==='B')nB++;});
-  const sInv=Math.max(0,ns-sc),lInv=Math.max(0,nl-lc),sr=vol?sd/vol:null;
+  const sr=vol?sd/vol:null;
   let fpos=null;if(f.predFunding!=null&&f.minF!=null&&f.maxF!=null)fpos=f.maxF>f.minF?clamp((f.predFunding-f.minF)/(f.maxF-f.minF)):0.5;
   const dls=(f.ls&&f.ls24)?f.ls/f.ls24-1:null,dtop=(f.top&&f.top24)?f.top/f.top24-1:null;
   const invN=f.oiBTC?0.015*f.oiBTC:null,L=S.oiPct==null?null:S.oiPct;
@@ -284,7 +287,7 @@ function renderQuant(S){
   let h=g('多方燃料（推升／軋空）',q.bull,'up')+g('空方燃料（下殺／殺多）',q.bear,'dn')+`<div class="v" style="margin-bottom:8px">${q.verdict}</div>`;
   h+=`<table><tr><th>項目（權重）</th><th>數值</th><th>多</th><th>空</th></tr>`+
     q.C.map(c=>`<tr><td>${WNAME[c.k]}<span class="sub">權重 ${W[c.k]}</span></td><td>${c.raw}</td><td class="up">${s100(c.bull)}</td><td class="dn">${s100(c.bear)}</td></tr>`).join('')+`</table>`;
-  h+=`<div class="sub" style="margin-top:4px">12h 庫存（BTC）：新空 ${n0(q.ns)} − 空補 ${n0(q.sc)} → 未補 ${n0(q.sInv)}｜新多 ${n0(q.nl)} − 多平 ${n0(q.lc)} → 未平 ${n0(q.lInv)}</div>`;
+  h+=`<div class="sub" style="margin-top:4px">12h 庫存（BTC，依時間順序累計，平倉只扣更早建立的倉位）：未補空 ${n0(q.sInv)}（新空 ${n0(q.ns)}、空補 ${n0(q.sc)}）｜未平多 ${n0(q.lInv)}（新多 ${n0(q.nl)}、多平 ${n0(q.lc)}）</div>`;
   const LVC={'掃低收回':'up','突破中':'up','跌破中':'dn','掃高回落':'dn','未觸及':''};
   if(S.d&&S.d.levels&&S.d.levels.length)h+=`<h3>關鍵價位（看今天的日 K）</h3><table><tr><th>價位</th><th>名稱</th><th>狀態</th><th>距現價</th></tr>`+
     S.d.levels.map(z=>`<tr><td>${n0(z.p)}</td><td>${z.name}</td><td class="${LVC[z.s]}">${z.s}</td><td>${pc(z.dist,1)}</td></tr>`).join('')+`</table>`;
@@ -368,7 +371,7 @@ function summary(S,p){
   if(S.q){const q=S.q;
     L.push(`[量化] 多方燃料 ${q.bull==null?'—':Math.round(q.bull)}｜空方燃料 ${q.bear==null?'—':Math.round(q.bear)}｜${q.verdict}`);
     L.push(q.C.map(c=>`${WNAME[c.k]} ${c.raw} 多${s100(c.bull)}/空${s100(c.bear)}`).join('｜'));
-    L.push(`12h庫存 新空${n0(q.ns)}−空補${n0(q.sc)}→未補${n0(q.sInv)}｜新多${n0(q.nl)}−多平${n0(q.lc)}→未平${n0(q.lInv)}`);
+    L.push(`12h庫存(依時間累計) 未補空${n0(q.sInv)}(新空${n0(q.ns)} 空補${n0(q.sc)})｜未平多${n0(q.lInv)}(新多${n0(q.nl)} 多平${n0(q.lc)})`);
     if(Object.keys(WDEF).some(k=>W[k]!==WDEF[k]))L.push('權重(自訂) '+Object.keys(WDEF).map(k=>k+':'+W[k]).join(' '));}
   if(d&&d.levels&&d.levels.length)L.push('[關鍵價] '+d.levels.map(z=>`${n0(z.p)} ${z.name} ${z.s} ${pc(z.dist,1)}`).join('｜'));
   if(S.h1&&S.h1.ev&&S.h1.ev.length)L.push('[1H掃點] '+S.h1.ev.map(z=>z.t+' '+z.txt).join('｜'));
