@@ -32,7 +32,15 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
 th,td{padding:4px 3px;text-align:right;border-bottom:1px solid var(--line)}th:first-child,td:first-child{text-align:left}
 th{color:var(--mut);font-weight:500}
 .err{color:var(--dn);font-size:12px;white-space:pre-wrap}
-.pos{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}
+.pos{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.gl{display:flex;justify-content:space-between;align-items:baseline;font-size:13px}
+.gl b{font-size:20px;font-variant-numeric:tabular-nums}
+.gauge{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin:2px 0 8px}
+.gauge i{display:block;height:100%}
+.upbg{background:var(--up)}.dnbg{background:var(--dn)}
+.card h3{font-size:13px;margin:12px 0 6px;color:var(--mut);font-weight:600}
+td .sub{display:block;font-size:10px}
+label.k{display:block}
 input,select{font:inherit;width:100%;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
 textarea{width:100%;height:220px;font:12px/1.4 ui-monospace,Menlo,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px}
 #toast{position:sticky;bottom:10px;text-align:center;opacity:0;transition:opacity .3s;pointer-events:none}
@@ -49,6 +57,7 @@ textarea{width:100%;height:220px;font:12px/1.4 ui-monospace,Menlo,monospace;back
 <div id="status" class="err"></div>
 
 <div class="card"><h2>價格</h2><div id="price"></div></div>
+<div class="card"><h2>量化判讀</h2><div id="quant"></div></div>
 <div class="card"><h2>日線</h2><div id="daily"></div></div>
 <div class="card"><h2>週線</h2><div id="weekly"></div></div>
 <div class="card"><h2>4 小時</h2><div id="h4"></div></div>
@@ -61,9 +70,15 @@ textarea{width:100%;height:220px;font:12px/1.4 ui-monospace,Menlo,monospace;back
     <select id="pSide"><option value="">無部位</option><option value="short">空</option><option value="long">多</option></select>
     <input id="pEntry" type="number" inputmode="decimal" placeholder="開倉價">
     <input id="pLev" type="number" inputmode="decimal" placeholder="槓桿" value="10">
+    <input id="pStop" type="number" inputmode="decimal" placeholder="停損價（選填）">
   </div>
   <div id="posOut" style="margin-top:8px"></div>
 </div>
+<details class="card"><summary>量化權重（預設值，可自行調整）</summary>
+  <div id="wbox" class="grid" style="margin-top:8px"></div>
+  <div class="bar"><button id="btnWReset">恢復預設</button></div>
+  <div class="sub">權重只影響燃料分數，存在這支手機。設為 0 代表不計入。</div>
+</details>
 <details class="card"><summary>摘要文字（複製失敗時長按全選）</summary><textarea id="sum" readonly></textarea></details>
 <div id="toast"><span>已複製，貼到 Claude 對話即可</span></div>
 
@@ -89,6 +104,54 @@ const pc=(x,d=2)=>x==null||isNaN(x)?'—':(x>=0?'+':'')+(x*100).toFixed(d)+'%';
 const cls=x=>x==null?'':(x>=0?'up':'dn');
 const fo=o=>o==null||o.v==null||isNaN(o.v)?'—':(o.approx?'≈':'')+n0(o.v);
 const kv=(k,v,c='')=>`<div><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`;
+
+// ===== 量化判讀 =====
+const clamp=x=>Math.max(0,Math.min(1,x));
+const mapR=(x,a,b)=>x==null||isNaN(x)?null:clamp((x-a)/(b-a));
+const s100=x=>x==null||isNaN(x)?'—':Math.round(x*100);
+const TAG={nl:'新多',ns:'新空',sc:'空補',lc:'多平',x:'換手'};
+const ABN={B:'買被吸收',S:'賣被吸收'};
+const WDEF={fund:20,ls:10,inv:20,spot:20,abs:10,top:10,lev:10};
+const WNAME={fund:'資金費率位置',ls:'散戶帳戶比 24h',inv:'未平倉庫存 12h',spot:'現貨淨買比 12h',abs:'吸收 12h',top:'大戶持倉比 24h',lev:'槓桿水位 OI 30日分位'};
+let W=(()=>{let w={};try{w=JSON.parse(localStorage.getItem('btcw')||'{}')||{};}catch(_){}const o={};for(const k in WDEF)o[k]=(w[k]!=null&&isFinite(+w[k]))?Math.max(0,+w[k]):WDEF[k];return o;})();
+const saveW=()=>{try{localStorage.setItem('btcw',JSON.stringify(W));}catch(_){}};
+
+// 每根 K 線歸類：OI 增加＝新多/新空，OI 減少＝空補/多平；方向看合約Δ，合約Δ太小（<150 BTC）改看價格方向
+// 吸收：主動淨量（現貨Δ＋合約Δ）夠大，但價格反向或幾乎沒動（<0.1%）
+function classify(rows,oiRef,thF,absMin){const th=oiRef?oiRef*thF:80;
+  rows.forEach(r=>{const d=r.doi?r.doi.v:null,pd=r.pd,dp=(r.o!=null&&r.c!=null)?r.c-r.o:0;
+    const dir=(pd!=null&&Math.abs(pd)>=150)?Math.sign(pd):Math.sign(dp);
+    let k=null;if(d!=null&&pd!=null)k=dir===0?'x':d>th?(dir>0?'nl':'ns'):d<-th?(dir>0?'sc':'lc'):'x';
+    r.kind=k;r.tag=k?TAG[k]:'—';
+    const comb=(r.sd||0)+(pd||0);
+    r.ab=(pd!=null&&r.o&&Math.abs(comb)>=absMin&&(Math.sign(dp)!==Math.sign(comb)||Math.abs(dp/r.o)<0.001))?(comb>0?'B':'S'):null;});}
+
+// 燃料分數：每項換成 0~1，多方＝推升/軋空的燃料，空方＝下殺/殺多的燃料，再依權重加總成 0~100
+function quant(S){
+  const f=S.f||{},x=S.h1;if(!x)return null;
+  let ns=0,sc=0,nl=0,lc=0,sd=0,vol=0,nS=0,nB=0;
+  x.rows.forEach(r=>{const a=r.doi?Math.abs(r.doi.v):0;
+    if(r.kind==='ns')ns+=a;else if(r.kind==='sc')sc+=a;else if(r.kind==='nl')nl+=a;else if(r.kind==='lc')lc+=a;
+    sd+=r.sd||0;vol+=r.v||0;if(r.ab==='S')nS++;if(r.ab==='B')nB++;});
+  const sInv=Math.max(0,ns-sc),lInv=Math.max(0,nl-lc),sr=vol?sd/vol:null;
+  let fpos=null;if(f.predFunding!=null&&f.minF!=null&&f.maxF!=null)fpos=f.maxF>f.minF?clamp((f.predFunding-f.minF)/(f.maxF-f.minF)):0.5;
+  const dls=(f.ls&&f.ls24)?f.ls/f.ls24-1:null,dtop=(f.top&&f.top24)?f.top/f.top24-1:null;
+  const invN=f.oiBTC?0.015*f.oiBTC:null,L=S.oiPct==null?null:S.oiPct;
+  const C=[
+    {k:'fund',raw:fpos==null?'—':(f.predFunding*100).toFixed(4)+'%（30期區間 '+Math.round(fpos*100)+'%）',bull:fpos==null?null:1-fpos,bear:fpos},
+    {k:'ls',raw:dls==null?'—':pc(dls,1)+'（'+n2(f.ls)+'）',bull:dls==null?null:1-mapR(dls,-.08,.08),bear:mapR(dls,-.08,.08)},
+    {k:'inv',raw:'未補空 '+n0(sInv)+' / 未平多 '+n0(lInv),bull:invN?clamp(sInv/invN):null,bear:invN?clamp(lInv/invN):null},
+    {k:'spot',raw:pc(sr,1),bull:mapR(sr,-.08,.08),bear:sr==null?null:1-mapR(sr,-.08,.08)},
+    {k:'abs',raw:'賣被吸收 '+nS+' / 買被吸收 '+nB,bull:clamp(.5+(nS-nB)/6),bear:clamp(.5+(nB-nS)/6)},
+    {k:'top',raw:dtop==null?'—':pc(dtop,1)+'（'+n2(f.top)+'）',bull:mapR(dtop,-.05,.05),bear:dtop==null?null:1-mapR(dtop,-.05,.05)},
+    {k:'lev',raw:L==null?'—':Math.round(L*100)+'%',bull:L,bear:L}];
+  let ws=0,b=0,e=0;C.forEach(c=>{const w=W[c.k]||0;if(c.bull==null||c.bear==null||!w)return;ws+=w;b+=w*c.bull;e+=w*c.bear;});
+  const bull=ws?100*b/ws:null,bear=ws?100*e/ws:null;
+  let verdict='—';
+  if(bull!=null){const d=bull-bear;verdict=d>=15?'多方燃料較足':d<=-15?'空方燃料較足':'兩邊接近';
+    if(bull<45&&bear<45)verdict+='；兩邊都偏弱，容易區間震盪或假突破';else if(bull>=60&&bear>=60)verdict+='；兩邊都擁擠，容易雙向洗盤';}
+  return {C,bull,bear,verdict,ns,sc,nl,lc,sInv,lInv,sr,nS,nB};
+}
 
 async function load(){
   $('status').textContent='讀取中…';
@@ -133,7 +196,24 @@ function compute(R){
     const lows={},highs={};for(let i=Math.max(0,n-200);i<=n;i++){const m=tw(D.t[i],7);if(!lows[m]||D.l[i]<lows[m][1])lows[m]=[tw(D.t[i],10),D.l[i]];if(!highs[m]||D.h[i]>highs[m][1])highs[m]=[tw(D.t[i],10),D.h[i]];}
     let mn=1/0,mnI=0,mx=-1/0,mxI=0;for(let i=n-29;i<=n;i++){if(D.l[i]<mn){mn=D.l[i];mnI=i;}if(D.h[i]>mx){mx=D.h[i];mxI=i;}}
     const rows=[];for(let i=n-6;i<=n;i++)rows.push({d:tw(D.t[i],10).slice(5),o:D.o[i],h:D.h[i],l:D.l[i],c:D.c[i],v:D.v[i],dl:2*D.tb[i]-D.v[i],rsi:r[i]});
-    S.d={price:D.c[n],today:{o:D.o[n],h:D.h[n],l:D.l[n],c:D.c[n]},prev:{o:D.o[n-1],h:D.h[n-1],l:D.l[n-1],c:D.c[n-1]},
+    // 關鍵價位：昨高低、前 30 日高低、之前各月高低；以昨收判斷是支撐還是壓力，再看今天 K 線有沒有掃到
+    const lv=[],ref=D.c[n-1],px=D.c[n];
+    const addL=(name,p)=>{if(p==null||!isFinite(p))return;const ex=lv.find(z=>Math.abs(z.p/p-1)<0.0005);if(ex){ex.name+='/'+name;return;}lv.push({name,p});};
+    addL('昨高',D.h[n-1]);addL('昨低',D.l[n-1]);
+    let l30=1/0,h30=-1/0;for(let i=Math.max(0,n-30);i<n;i++){if(D.l[i]<l30)l30=D.l[i];if(D.h[i]>h30)h30=D.h[i];}
+    addL('前30日高',h30);addL('前30日低',l30);
+    const curM=tw(D.t[n],7);
+    Object.entries(highs).forEach(([m,v])=>{if(m!==curM)addL(m.slice(2)+'月高',v[1]);});
+    Object.entries(lows).forEach(([m,v])=>{if(m!==curM)addL(m.slice(2)+'月低',v[1]);});
+    const all=lv.map(z=>{let s;
+      if(z.p<ref)s=D.l[n]<z.p?(px>=z.p?'掃低收回':'跌破中'):'未觸及';
+      else s=D.h[n]>z.p?(px<=z.p?'掃高回落':'突破中'):'未觸及';
+      return Object.assign(z,{s,dist:z.p/px-1});});
+    // 今天碰過的全列；沒碰過的只留上下各最近 3 個（6% 以內）
+    const hit=all.filter(z=>z.s!=='未觸及'),far=all.filter(z=>z.s==='未觸及'&&Math.abs(z.dist)<=0.06);
+    const up=far.filter(z=>z.dist>0).sort((a,b)=>a.dist-b.dist).slice(0,3),dn=far.filter(z=>z.dist<=0).sort((a,b)=>b.dist-a.dist).slice(0,3);
+    const levels=hit.concat(up,dn).sort((a,b)=>b.p-a.p);
+    S.d={levels,price:D.c[n],today:{o:D.o[n],h:D.h[n],l:D.l[n],c:D.c[n]},prev:{o:D.o[n-1],h:D.h[n-1],l:D.l[n-1],c:D.c[n-1]},
       ma20:sma(D.c,20),ma20_5:sma(D.c,20,n-5),ma50:sma(D.c,50),ma50_5:sma(D.c,50,n-5),ma200:sma(D.c,200),ma200_10:sma(D.c,200,n-10),ema21:e21[n],
       rsi:r[n],rsiPrev:r[n-1],bias:cb,biasPct:bias.filter(x=>x<=cb).length/bias.length,biasDays:bias.length,
       lo30:[tw(D.t[mnI],10),mn],hi30:[tw(D.t[mxI],10),mx],lows,highs,rows};}
@@ -143,7 +223,8 @@ function compute(R){
   if(R.h){const H=pk(R.h),q=H.c.length-1,r=rsiS(H.c);
     S.h={ma20:sma(H.c,20),ma50:sma(H.c,50),ma200:sma(H.c,200),rsi:r[q]};
     const perp={};if(R.pk4)R.pk4.forEach(x=>perp[+x[0]]=2*(+x[9])-(+x[5]));
-    const rows=[];for(let i=q-11;i<=q;i++){const t=H.t[i];rows.push({t:tw(t).slice(5),c:H.c[i],h:H.h[i],l:H.l[i],sd:2*H.tb[i]-H.v[i],pd:perp[t],oi:oiAt(t+4*3600e3),rsi:r[i]});}
+    const rows=[];for(let i=q-11;i<=q;i++){const t=H.t[i],o1=oiAt(t+4*3600e3),o0=oiAt(t);
+      rows.push({t:tw(t).slice(5),o:H.o[i],c:H.c[i],h:H.h[i],l:H.l[i],sd:2*H.tb[i]-H.v[i],pd:perp[t],oi:o1,doi:(o1&&o0)?{v:o1.v-o0.v,approx:o1.approx||o0.approx}:null,rsi:r[i]});}
     S.flow=rows;
     let li=Math.max(0,q-179);for(let i=li;i<=q;i++)if(H.l[i]<H.l[li])li=i;
     let sc=0,pcv=0,pn=0;for(let i=li;i<=q;i++){sc+=2*H.tb[i]-H.v[i];const v=perp[H.t[i]];if(v!=null){pcv+=v;pn++;}}
@@ -152,10 +233,19 @@ function compute(R){
   if(R.h1){const H=pk(R.h1),q=H.c.length-1;
     const perp={};if(R.pk1)R.pk1.forEach(x=>perp[+x[0]]=2*(+x[9])-(+x[5]));
     const rows=[];for(let i=q-11;i<=q;i++){const t=H.t[i],o=oiAt(t+3600e3),o0=oiAt(t);
-      rows.push({t:tw(t).slice(5),c:H.c[i],sd:2*H.tb[i]-H.v[i],pd:perp[t],oi:o,doi:(o&&o0)?{v:o.v-o0.v,approx:o.approx||o0.approx}:null});}
+      rows.push({t:tw(t).slice(5),o:H.o[i],c:H.c[i],v:H.v[i],sd:2*H.tb[i]-H.v[i],pd:perp[t],oi:o,doi:(o&&o0)?{v:o.v-o0.v,approx:o.approx||o0.approx}:null});}
     let streak=0;for(let i=rows.length-2;i>=0;i--){if(rows[i].sd>0)streak++;else break;}
     let hi=-1/0,lo=1/0,hiT=0,loT=0;for(let i=Math.max(0,q-23);i<=q;i++){if(H.h[i]>hi){hi=H.h[i];hiT=H.t[i];}if(H.l[i]<lo){lo=H.l[i];loT=H.t[i];}}
-    S.h1={rows,streak,curPos:rows[rows.length-1].sd>0,hi,lo,hiT:tw(hiT).slice(5),loT:tw(loT).slice(5)};}
+    // 1H 擺動高低點（左右各 2 根，只用已收盤的 K 線確認），給結構停損用
+    const piv={hi:[],lo:[]};for(let i=2;i<=q-3;i++){const a=H.h[i],b=H.l[i];
+      if(a>H.h[i-1]&&a>H.h[i-2]&&a>=H.h[i+1]&&a>=H.h[i+2])piv.hi.push({t:tw(H.t[i]).slice(5),p:a});
+      if(b<H.l[i-1]&&b<H.l[i-2]&&b<=H.l[i+1]&&b<=H.l[i+2])piv.lo.push({t:tw(H.t[i]).slice(5),p:b});}
+    // 近 12 根 1H：有沒有掃到前 24 根的高/低點、收線是收回還是突破
+    const ev=[];for(let j=Math.max(24,q-11);j<=q;j++){let l24=1/0,h24=-1/0;for(let k=j-24;k<j;k++){if(H.l[k]<l24)l24=H.l[k];if(H.h[k]>h24)h24=H.h[k];}
+      const lab=tw(H.t[j]).slice(5)+(j===q?'（未收）':'');
+      if(H.l[j]<l24)ev.push(H.c[j]>l24?{t:lab,txt:'掃 24h 低 '+n0(l24)+' 後收回',b:1}:{t:lab,txt:'跌破 24h 低 '+n0(l24),b:-1});
+      if(H.h[j]>h24)ev.push(H.c[j]<h24?{t:lab,txt:'掃 24h 高 '+n0(h24)+' 後回落',b:-1}:{t:lab,txt:'突破 24h 高 '+n0(h24),b:1});}
+    S.h1={rows,streak,curPos:rows[rows.length-1].sd>0,hi,lo,hiT:tw(hiT).slice(5),loT:tw(loT).slice(5),piv,ev:ev.slice(-5)};}
   if(R.pi)S.f={mark:+R.pi.markPrice,index:+R.pi.indexPrice,predFunding:+R.pi.lastFundingRate};
   if(R.fr&&R.fr.length){const f=R.fr.map(x=>+x.fundingRate);S.f=Object.assign(S.f||{},{lastSettled:f[f.length-1],minF:Math.min(...f),maxF:Math.max(...f),negCount:f.filter(x=>x<0).length,frN:f.length});}
   if(live){const b24=oiBefore(live.t-24*3600e3),b7=oiBefore(live.t-7*24*3600e3);
@@ -164,16 +254,50 @@ function compute(R){
   // 主動買賣比直接用合約 4H K 線的主動買量算（即時，含未收那根），不再用每 4 小時才更新的 takerlongshortRatio
   S.f=Object.assign(S.f||{},{ls:last(R.ls,'longShortRatio'),ls24:ago(R.ls,'longShortRatio',24),top:last(R.top,'longShortRatio'),top24:ago(R.top,'longShortRatio',24),
     tk:R.pk4&&R.pk4.length?R.pk4.slice(-6).map(x=>{const v=+x[5],b=+x[9];return v-b>0?b/(v-b):null;}):null});
+  // 槓桿水位：即時 OI 在近 30 天（4H 歷史點）的分位
+  if(R.oi4&&R.oi4.length&&live){const a=R.oi4.map(x=>+x.sumOpenInterest);S.oiPct=a.filter(v=>v<=live.v).length/a.length;}
+  const oiRef=live?live.v:null;
+  if(S.h1)classify(S.h1.rows,oiRef,0.001,300);
+  if(S.flow)classify(S.flow,oiRef,0.002,600);
+  S.q=quant(S);
   return S;
 }
 
-function posCalc(price){
-  const side=$('pSide').value,e=parseFloat($('pEntry').value),lev=parseFloat($('pLev').value)||10;
-  try{localStorage.setItem('btcpos',JSON.stringify({side,e:$('pEntry').value,lev:$('pLev').value}));}catch(_){}
+function posCalc(price,S){
+  const side=$('pSide').value,e=parseFloat($('pEntry').value),lev=parseFloat($('pLev').value)||10,st=parseFloat($('pStop').value);
+  try{localStorage.setItem('btcpos',JSON.stringify({side,e:$('pEntry').value,lev:$('pLev').value,s:$('pStop').value}));}catch(_){}
   if(!side||!e||!price)return null;
-  const pnl=side==='short'?(e-price)/e:(price-e)/e;
-  const liq=side==='short'?e*(1+1/lev-MMR):e*(1-1/lev+MMR);
-  return {side,e,lev,pnl,roe:pnl*lev,liq,dist:side==='short'?liq/price-1:1-liq/price};
+  const sh=side==='short',pnlAt=p=>(sh?(e-p)/e:(p-e)/e)*lev;
+  const pnl=sh?(e-price)/e:(price-e)/e;
+  const liq=sh?e*(1+1/lev-MMR):e*(1-1/lev+MMR);
+  // 自訂停損：鎖住多少保證金、距現價多遠
+  const us=st?{p:st,roe:pnlAt(st),dist:sh?st/price-1:1-st/price,hit:sh?price>=st:price<=st}:null;
+  // 結構停損參考：最近一個在現價另一側的 1H 擺動高（空）或擺動低（多），外加 0.1%
+  let ss=null;const P=S&&S.h1&&S.h1.piv;
+  if(P){const arr=sh?P.hi:P.lo;for(let k=arr.length-1;k>=0;k--){const z=arr[k];if(sh?z.p>price:z.p<price){const p=sh?z.p*1.001:z.p*0.999;ss={ref:z,p,roe:pnlAt(p),dist:sh?p/price-1:1-p/price};break;}}}
+  return {side,e,lev,pnl,roe:pnl*lev,liq,dist:sh?liq/price-1:1-liq/price,us,ss};
+}
+
+function renderQuant(S){
+  const q=S.q;if(!q){$('quant').innerHTML='<div class="sub">1H 資料不足，無法計算</div>';return;}
+  const g=(lab,v,c)=>`<div class="gl"><span>${lab}</span><b class="${c}">${v==null?'—':Math.round(v)}</b></div><div class="gauge"><i class="${c}bg" style="width:${v==null?0:Math.round(v)}%"></i></div>`;
+  let h=g('多方燃料（推升／軋空）',q.bull,'up')+g('空方燃料（下殺／殺多）',q.bear,'dn')+`<div class="v" style="margin-bottom:8px">${q.verdict}</div>`;
+  h+=`<table><tr><th>項目（權重）</th><th>數值</th><th>多</th><th>空</th></tr>`+
+    q.C.map(c=>`<tr><td>${WNAME[c.k]}<span class="sub">權重 ${W[c.k]}</span></td><td>${c.raw}</td><td class="up">${s100(c.bull)}</td><td class="dn">${s100(c.bear)}</td></tr>`).join('')+`</table>`;
+  h+=`<div class="sub" style="margin-top:4px">12h 庫存（BTC）：新空 ${n0(q.ns)} − 空補 ${n0(q.sc)} → 未補 ${n0(q.sInv)}｜新多 ${n0(q.nl)} − 多平 ${n0(q.lc)} → 未平 ${n0(q.lInv)}</div>`;
+  const LVC={'掃低收回':'up','突破中':'up','跌破中':'dn','掃高回落':'dn','未觸及':''};
+  if(S.d&&S.d.levels&&S.d.levels.length)h+=`<h3>關鍵價位（看今天的日 K）</h3><table><tr><th>價位</th><th>名稱</th><th>狀態</th><th>距現價</th></tr>`+
+    S.d.levels.map(z=>`<tr><td>${n0(z.p)}</td><td>${z.name}</td><td class="${LVC[z.s]}">${z.s}</td><td>${pc(z.dist,1)}</td></tr>`).join('')+`</table>`;
+  if(S.h1&&S.h1.ev)h+=`<h3>1H 掃高／掃低（近 12 根）</h3>`+(S.h1.ev.length?S.h1.ev.map(z=>`<div class="${z.b>0?'up':'dn'}">${z.t}｜${z.txt}</div>`).join(''):'<div class="sub">沒有</div>');
+  h+=`<div class="sub" style="margin-top:8px">分數是把判讀規則量化的啟發式指標，不是預測。燃料＝可被清算的擁擠部位（費率、散戶比、未平倉庫存）＋主動資金（現貨淨買、吸收、大戶）＋槓桿水位。判讀欄：OI 增加＝新多／新空，OI 減少＝空補／多平，方向看合約Δ（小於 150 BTC 時改看價格）；吸收＝主動淨量夠大（1H ≥300、4H ≥600 BTC）但價格反向或幾乎沒動。</div>`;
+  $('quant').innerHTML=h;
+}
+const tagCell=r=>`<td>${r.tag||'—'}${r.ab?'<span class="sub '+(r.ab==='B'?'dn':'up')+'">'+ABN[r.ab]+'</span>':''}</td>`;
+const tagTxt=r=>' '+(r.tag||'—')+(r.ab?'('+ABN[r.ab]+')':'');
+
+function buildW(){
+  $('wbox').innerHTML=Object.keys(WDEF).map(k=>`<label class="k">${WNAME[k]}<input type="number" inputmode="decimal" min="0" data-w="${k}" value="${W[k]}"></label>`).join('');
+  $('wbox').querySelectorAll('input').forEach(el=>el.addEventListener('input',()=>{const v=parseFloat(el.value);W[el.dataset.w]=isFinite(v)&&v>0?v:0;saveW();if(SNAP){SNAP.q=quant(SNAP);render(SNAP);}}));
 }
 
 function render(S){
@@ -194,8 +318,9 @@ function render(S){
       ${kv('50W SMA',n0(w.sma50))}${kv('週 RSI（上週）',n2(w.rsi)+'（'+n2(w.rsiPrev)+'）')}
     </div>`;}
   if(h){$('h4').innerHTML=`<div class="grid">${kv('MA20',n0(h.ma20))}${kv('MA50',n0(h.ma50))}${kv('MA200',n0(h.ma200))}${kv('RSI14',n2(h.rsi))}</div>`;}
-  if(S.flow){$('flow').innerHTML=`<table><tr><th>時間</th><th>收</th><th>現貨Δ</th><th>合約Δ</th><th>OI(BTC)</th><th>RSI</th></tr>`+
-    S.flow.map(r=>`<tr><td>${r.t}</td><td>${n0(r.c)}</td><td class="${cls(r.sd)}">${n0(r.sd)}</td><td class="${cls(r.pd)}">${n0(r.pd)}</td><td>${fo(r.oi)}</td><td>${n2(r.rsi)}</td></tr>`).join('')+
+  renderQuant(S);
+  if(S.flow){$('flow').innerHTML=`<table><tr><th>時間</th><th>收</th><th>現貨Δ</th><th>合約Δ</th><th>OI(BTC)</th><th>RSI</th><th>判讀</th></tr>`+
+    S.flow.map(r=>`<tr><td>${r.t}</td><td>${n0(r.c)}</td><td class="${cls(r.sd)}">${n0(r.sd)}</td><td class="${cls(r.pd)}">${n0(r.pd)}</td><td>${fo(r.oi)}</td><td>${n2(r.rsi)}</td>${tagCell(r)}</tr>`).join('')+
     `</table><div class="sub" style="margin-top:6px">Δ = 主動買 − 主動賣（BTC）。OI 為該根收盤時的未平倉量；最後一列未收，OI 為即時值。≈ = 幣安尚未發布該時點，以即時 OI 近似。</div>`;}
   if(S.anch){const a=S.anch;$('anch').innerHTML=`<div class="grid">
     ${kv('起點（4H，含低點那根）',a.t.slice(5)+' · 低 '+n0(a.low))}${kv('經過',a.bars+' 根 4H')}
@@ -205,8 +330,8 @@ function render(S){
   if(S.h1){const x=S.h1;$('h1').innerHTML=`<div class="grid" style="margin-bottom:8px">
     ${kv('24h 高',n0(x.hi)+'（'+x.hiT+'）')}${kv('24h 低',n0(x.lo)+'（'+x.loT+'）')}
     ${kv('現貨淨量連續為正（已收盤）',x.streak+' 根',x.streak>0?'up':'')}${kv('目前這根',x.curPos?'正':'負',x.curPos?'up':'dn')}
-  </div><table><tr><th>時間</th><th>收</th><th>現貨Δ</th><th>合約Δ</th><th>OI</th><th>ΔOI</th></tr>`+
-    x.rows.map(r=>`<tr><td>${r.t}</td><td>${n0(r.c)}</td><td class="${cls(r.sd)}">${n0(r.sd)}</td><td class="${cls(r.pd)}">${n0(r.pd)}</td><td>${fo(r.oi)}</td><td class="${cls(r.doi&&r.doi.v)}">${fo(r.doi)}</td></tr>`).join('')+
+  </div><table><tr><th>時間</th><th>收</th><th>現貨Δ</th><th>合約Δ</th><th>OI</th><th>ΔOI</th><th>判讀</th></tr>`+
+    x.rows.map(r=>`<tr><td>${r.t}</td><td>${n0(r.c)}</td><td class="${cls(r.sd)}">${n0(r.sd)}</td><td class="${cls(r.pd)}">${n0(r.pd)}</td><td>${fo(r.oi)}</td><td class="${cls(r.doi&&r.doi.v)}">${fo(r.doi)}</td>${tagCell(r)}</tr>`).join('')+
     `</table><div class="sub" style="margin-top:6px">最後一列是尚未收盤的那根，OI 為即時值、ΔOI 為開盤至今。≈ = 幣安尚未發布該時點，以即時 OI 近似。</div>`;}
   $('fut').innerHTML=`<div class="grid">
     ${kv('標記價',n0(f.mark))}${kv('預估資金費率',f.predFunding==null?'—':(f.predFunding*100).toFixed(4)+'%',cls(f.predFunding))}
@@ -215,8 +340,12 @@ function render(S){
     ${kv('散戶多空帳戶比（24h 前）',n2(f.ls)+'（'+n2(f.ls24)+'）')}${kv('大戶持倉比（24h 前）',n2(f.top)+'（'+n2(f.top24)+'）')}
     ${kv('主動買賣比 近 6 根 4H（末根未收）',f.tk?f.tk.map(n2).join(' '):'—')}
   </div>`;
-  const p=posCalc(d&&d.price);
-  $('posOut').innerHTML=p?`<div class="grid">${kv('浮動損益',pc(p.pnl)+'（保證金 '+pc(p.roe,1)+'）',cls(p.pnl))}${kv('估計強平價',n0(p.liq)+'（距 '+pc(p.dist,1)+'）')}</div><div class="sub">逐倉估算，維持保證金率以 0.4% 計，未含手續費與資金費。</div>`:'<div class="sub">填入方向、開倉價、槓桿後，會一起放進摘要。</div>';
+  const p=posCalc(d&&d.price,S);
+  const sideW=p&&p.side==='short'?'高':'低';
+  $('posOut').innerHTML=p?`<div class="grid">${kv('浮動損益',pc(p.pnl)+'（保證金 '+pc(p.roe,1)+'）',cls(p.pnl))}${kv('估計強平價',n0(p.liq)+'（距 '+pc(p.dist,1)+'）')}`+
+    (p.us?kv('停損 '+n0(p.us.p)+(p.us.hit?'（價格已越過）':'（距 '+pc(p.us.dist,1)+'）'),'觸發時保證金 '+pc(p.us.roe,1),cls(p.us.roe)):'')+
+    (p.ss?kv('結構停損參考（1H 擺動'+sideW+' '+n0(p.ss.ref.p)+' @'+p.ss.ref.t+'）',n0(p.ss.p)+'｜保證金 '+pc(p.ss.roe,1),cls(p.ss.roe)):'')+
+    `</div><div class="sub">逐倉估算，維持保證金率以 0.4% 計，未含手續費與資金費。結構停損＝最近一個在現價另一側的 1H 擺動${sideW}點，外加 0.1%。</div>`:'<div class="sub">填入方向、開倉價、槓桿後，會一起放進摘要。</div>';
   $('sum').value=summary(S,p);
 }
 
@@ -231,12 +360,22 @@ function summary(S,p){
     L.push('近7日 日期 O/H/L/C 量 現貨Δ RSI');d.rows.forEach(r=>L.push(`${r.d} ${n0(r.o)}/${n0(r.h)}/${n0(r.l)}/${n0(r.c)} ${n0(r.v)} ${n0(r.dl)} ${n2(r.rsi)}`));}
   if(w)L.push(`[週線] 上週(${w.prev.d.slice(5)}) O${n0(w.prev.o)} H${n0(w.prev.h)} L${n0(w.prev.l)} C${n0(w.prev.c)}｜本週 O${n0(w.cur.o)} H${n0(w.cur.h)} L${n0(w.cur.l)} C${n0(w.cur.c)}｜200W ${n0(w.wma200)}(4週前${n0(w.wma200_4)}) 20W ${n0(w.sma20)} 21WEMA ${n0(w.ema21)} 50W ${n0(w.sma50)}｜週RSI ${n2(w.rsi)}(上週${n2(w.rsiPrev)})`);
   if(h)L.push(`[4H] MA20 ${n0(h.ma20)} MA50 ${n0(h.ma50)} MA200 ${n0(h.ma200)} RSI ${n2(h.rsi)}`);
-  if(S.flow){L.push('4H 時間 收 現貨Δ 合約Δ OI RSI（最後一列未收，OI 即時）');S.flow.forEach(r=>L.push(`${r.t} ${n0(r.c)} ${n0(r.sd)} ${n0(r.pd)} ${fo(r.oi)} ${n2(r.rsi)}`));}
+  if(S.flow){L.push('4H 時間 收 現貨Δ 合約Δ OI RSI 判讀（最後一列未收，OI 即時）');S.flow.forEach(r=>L.push(`${r.t} ${n0(r.c)} ${n0(r.sd)} ${n0(r.pd)} ${fo(r.oi)} ${n2(r.rsi)}`+tagTxt(r)));}
   if(S.anch){const a=S.anch;L.push(`[錨定] 自30日低點 ${a.t.slice(5)}(低${n0(a.low)}) ${a.bars}根4H｜現貨累計Δ ${n0(a.spot)}｜合約累計Δ ${a.perp==null?'—':n0(a.perp)}｜OI ${a.oiLow?n0(a.oiLow)+'→'+n0(a.oiNow)+' '+pc(a.oiChg):'—'}`);}
   if(S.h1){const x=S.h1;L.push(`[1H] 24h高${n0(x.hi)}(${x.hiT}) 低${n0(x.lo)}(${x.loT})｜現貨Δ連續為正 ${x.streak} 根(已收)｜當根${x.curPos?'正':'負'}`);
-    L.push('1H 時間 收 現貨Δ 合約Δ OI ΔOI（最後一列未收：OI 即時、ΔOI 開盤至今；≈ 幣安未發布、以即時值近似）');x.rows.forEach(r=>L.push(`${r.t} ${n0(r.c)} ${n0(r.sd)} ${n0(r.pd)} ${fo(r.oi)} ${fo(r.doi)}`));}
+    L.push('1H 時間 收 現貨Δ 合約Δ OI ΔOI 判讀（最後一列未收：OI 即時、ΔOI 開盤至今；≈ 幣安未發布、以即時值近似）');x.rows.forEach(r=>L.push(`${r.t} ${n0(r.c)} ${n0(r.sd)} ${n0(r.pd)} ${fo(r.oi)} ${fo(r.doi)}`+tagTxt(r)));}
   L.push(`[合約] 標記${n0(f.mark)} 預估費率${f.predFunding==null?'—':(f.predFunding*100).toFixed(4)+'%'} 近${f.frN||'—'}期 最低${f.minF==null?'—':(f.minF*100).toFixed(4)+'%'} 最高${f.maxF==null?'—':(f.maxF*100).toFixed(4)+'%'} 負費率${f.negCount??'—'}期｜OI ${n0(f.oiBTC)}BTC${f.oiStale?'(非即時)':'(即時)'} 24h${pc(f.oi24h)} 7d${pc(f.oi7d)}｜帳戶多空比(1H)${n2(f.ls)}(24h前${n2(f.ls24)}) 大戶持倉比(1H)${n2(f.top)}(24h前${n2(f.top24)})｜主動買賣比(4H,末根未收) ${f.tk?f.tk.map(n2).join(' '):'—'}`);
-  if(p)L.push(`[部位] ${p.side==='short'?'空':'多'} ${n0(p.e)} x${p.lev}｜損益 ${pc(p.pnl)}(保證金${pc(p.roe,1)})｜估強平 ${n0(p.liq)}`);
+  if(S.q){const q=S.q;
+    L.push(`[量化] 多方燃料 ${q.bull==null?'—':Math.round(q.bull)}｜空方燃料 ${q.bear==null?'—':Math.round(q.bear)}｜${q.verdict}`);
+    L.push(q.C.map(c=>`${WNAME[c.k]} ${c.raw} 多${s100(c.bull)}/空${s100(c.bear)}`).join('｜'));
+    L.push(`12h庫存 新空${n0(q.ns)}−空補${n0(q.sc)}→未補${n0(q.sInv)}｜新多${n0(q.nl)}−多平${n0(q.lc)}→未平${n0(q.lInv)}`);
+    if(Object.keys(WDEF).some(k=>W[k]!==WDEF[k]))L.push('權重(自訂) '+Object.keys(WDEF).map(k=>k+':'+W[k]).join(' '));}
+  if(d&&d.levels&&d.levels.length)L.push('[關鍵價] '+d.levels.map(z=>`${n0(z.p)} ${z.name} ${z.s} ${pc(z.dist,1)}`).join('｜'));
+  if(S.h1&&S.h1.ev&&S.h1.ev.length)L.push('[1H掃點] '+S.h1.ev.map(z=>z.t+' '+z.txt).join('｜'));
+  if(p){let s=`[部位] ${p.side==='short'?'空':'多'} ${n0(p.e)} x${p.lev}｜損益 ${pc(p.pnl)}(保證金${pc(p.roe,1)})｜估強平 ${n0(p.liq)}`;
+    if(p.us)s+=`｜停損 ${n0(p.us.p)} 觸發時保證金${pc(p.us.roe,1)}${p.us.hit?'(價格已越過)':''}`;
+    if(p.ss)s+=`｜結構停損 ${n0(p.ss.p)}(1H擺動${p.side==='short'?'高':'低'}${n0(p.ss.ref.p)}@${p.ss.ref.t}) 保證金${pc(p.ss.roe,1)}`;
+    L.push(s);}
   if(S.errors&&S.errors.length)L.push('讀取失敗：'+S.errors.join('；'));
   return L.join('\n');
 }
@@ -246,8 +385,10 @@ $('btnRefresh').onclick=load;
 $('btnCopy').onclick=async()=>{const txt=$('sum').value;if(!txt)return;
   try{await navigator.clipboard.writeText(txt);toast();}
   catch(_){const ta=$('sum');ta.closest('details').open=true;ta.focus();ta.select();try{document.execCommand('copy');toast();}catch(__){}}};
-['pSide','pEntry','pLev'].forEach(id=>$(id).addEventListener('input',()=>SNAP&&render(SNAP)));
-try{const s=JSON.parse(localStorage.getItem('btcpos')||'{}');if(s.side)$('pSide').value=s.side;if(s.e)$('pEntry').value=s.e;if(s.lev)$('pLev').value=s.lev;}catch(_){}
+['pSide','pEntry','pLev','pStop'].forEach(id=>$(id).addEventListener('input',()=>SNAP&&render(SNAP)));
+try{const s=JSON.parse(localStorage.getItem('btcpos')||'{}');if(s.side)$('pSide').value=s.side;if(s.e)$('pEntry').value=s.e;if(s.lev)$('pLev').value=s.lev;if(s.s)$('pStop').value=s.s;}catch(_){}
+buildW();
+$('btnWReset').onclick=()=>{W=Object.assign({},WDEF);saveW();buildW();if(SNAP){SNAP.q=quant(SNAP);render(SNAP);}};
 load();
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&SNAP&&Date.now()-SNAP.now>60e3)load();});
 if('serviceWorker' in navigator&&location.protocol==='https:')navigator.serviceWorker.register('sw.js').catch(()=>{});
